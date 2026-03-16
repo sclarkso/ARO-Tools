@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -59,29 +60,47 @@ func (opts *RawMirrorOptions) Run(ctx context.Context) error {
 
 // Run performs the actual image mirror operation.
 func (o *CompletedMirrorOptions) Run(ctx context.Context) error {
-	logger := logr.FromContextOrDiscard(ctx)
+	logger := logr.FromContextOrDiscard(ctx).WithValues(
+		"targetACR", o.TargetACR,
+		"repository", o.Repository,
+		"mode", o.mode,
+	)
 
-	// check if source and target are the same registry
-	acrSuffix, err := mirror.GetACRDomainSuffix(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get ACR domain suffix: %w", err)
-	}
-	if IsSameRegistry(o.SourceRegistry, o.TargetACR, acrSuffix) {
+	if o.skipMirror {
 		logger.Info("Source and target registry are the same, skipping mirror")
 		return nil
 	}
 
 	if o.DryRun {
-		logger.Info("DRY_RUN is enabled, skipping image mirror")
+		logger.Info("Dry-run enabled, skipping image mirror")
 		return nil
 	}
 
-	logger.Info("Mirroring image", "source", o.Copier.SrcRef(), "target", o.Copier.DstRef())
+	switch o.mode {
+	case imageSourceModeRegistry:
+		tag := strings.TrimPrefix(o.Digest, "sha256:")
+		desc, err := mirror.CopyFromRegistry(ctx,
+			o.SourceRegistry, o.Repository, o.Digest, o.sourceCredential,
+			o.targetLoginServer, tag, o.targetCredential,
+		)
+		if err != nil {
+			return err
+		}
+		logger.Info("Image mirrored successfully", "digest", desc.Digest.String(), "tag", tag)
 
-	if err := o.Copier.CopyWithRetry(ctx); err != nil {
-		return fmt.Errorf("failed to mirror image: %w", err)
+	case imageSourceModeOCI:
+		desc, err := mirror.CopyFromOCILayout(ctx,
+			o.imageTarPath, o.buildTag,
+			o.targetLoginServer, o.Repository, o.targetCredential,
+		)
+		if err != nil {
+			return err
+		}
+		logger.Info("Image mirrored from OCI layout", "digest", desc.Digest.String(), "tag", o.buildTag)
+
+	default:
+		return fmt.Errorf("unsupported image source mode %q", o.mode)
 	}
 
-	logger.Info("Image mirrored successfully")
 	return nil
 }

@@ -21,9 +21,12 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
 const (
@@ -31,42 +34,25 @@ const (
 	RetryInterval = 30 * time.Second
 )
 
-// Copier performs registry-to-registry image copies with retry logic.
-type Copier struct {
-	srcRef           string
-	dstRef           string
-	sourceCredential Credential
-	targetCredential Credential
-}
-
-// NewCopier creates a new Copier for the given image reference and credentials.
-func NewCopier(
-	sourceRegistry, repository, digest, digestHex string,
-	targetLoginServer string,
-	sourceCredential, targetCredential Credential,
-) *Copier {
-	return &Copier{
-		srcRef:           fmt.Sprintf("%s/%s@%s", sourceRegistry, repository, digest),
-		dstRef:           fmt.Sprintf("%s/%s:%s", targetLoginServer, repository, digestHex),
-		sourceCredential: sourceCredential,
-		targetCredential: targetCredential,
-	}
-}
-
-// SrcRef returns the source image reference.
-func (c *Copier) SrcRef() string { return c.srcRef }
-
-// DstRef returns the destination image reference.
-func (c *Copier) DstRef() string { return c.dstRef }
-
-// CopyWithRetry attempts to copy an image with retry logic for transient failures.
-func (c *Copier) CopyWithRetry(ctx context.Context) error {
+// CopyFromRegistry copies an image from one registry to another with retry logic.
+func CopyFromRegistry(ctx context.Context, sourceRegistry, repository, digest string, sourceCredential Credential, targetRegistry, targetTag string, targetCredential Credential) (ocispec.Descriptor, error) {
 	logger := logr.FromContextOrDiscard(ctx)
+
+	srcRepo, err := newRepository(buildRepositoryReference(sourceRegistry, repository), sourceCredential)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to create source repository: %w", err)
+	}
+
+	dstRepo, err := newRepository(buildRepositoryReference(targetRegistry, repository), targetCredential)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to create target repository: %w", err)
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		err := c.copy(ctx)
+		desc, err := oras.Copy(ctx, srcRepo, digest, dstRepo, targetTag, oras.DefaultCopyOptions)
 		if err == nil {
-			return nil
+			return desc, nil
 		}
 		lastErr = err
 		if attempt < MaxRetries {
@@ -74,70 +60,58 @@ func (c *Copier) CopyWithRetry(ctx context.Context) error {
 			select {
 			case <-time.After(RetryInterval):
 			case <-ctx.Done():
-				return ctx.Err()
+				return ocispec.Descriptor{}, ctx.Err()
 			}
 		}
 	}
-	return fmt.Errorf("failed after %d attempts: %w", MaxRetries, lastErr)
+	return ocispec.Descriptor{}, fmt.Errorf("failed to copy %s/%s@%s to %s/%s:%s after %d attempts: %w",
+		NormalizeRegistryHost(sourceRegistry), repository, digest,
+		NormalizeRegistryHost(targetRegistry), repository, targetTag,
+		MaxRetries, lastErr)
 }
 
-func (c *Copier) copy(ctx context.Context) error {
-	// parse source reference
-	srcParts := strings.SplitN(c.srcRef, "/", 2)
-	if len(srcParts) != 2 {
-		return fmt.Errorf("invalid source reference: %s", c.srcRef)
-	}
-	srcRegistry := srcParts[0]
-	srcRepoAndRef := srcParts[1]
-
-	// parse destination reference
-	dstParts := strings.SplitN(c.dstRef, "/", 2)
-	if len(dstParts) != 2 {
-		return fmt.Errorf("invalid destination reference: %s", c.dstRef)
-	}
-	dstRegistry := dstParts[0]
-	dstRepoAndRef := dstParts[1]
-
-	// set up source repository
-	srcRepo, err := remote.NewRepository(fmt.Sprintf("%s/%s", srcRegistry, strings.Split(srcRepoAndRef, "@")[0]))
+// CopyFromOCILayout copies an image from an OCI layout tar to a registry.
+func CopyFromOCILayout(ctx context.Context, imageTarPath, buildTag, targetRegistry, repository string, targetCredential Credential) (ocispec.Descriptor, error) {
+	sourceStore, err := oci.NewFromTar(ctx, imageTarPath)
 	if err != nil {
-		return fmt.Errorf("failed to create source repository: %w", err)
-	}
-	srcCred := c.sourceCredential
-	srcRepo.Client = &auth.Client{
-		Credential: func(ctx context.Context, hostport string) (auth.Credential, error) {
-			return auth.Credential{Username: srcCred.Username, Password: srcCred.Password}, nil
-		},
+		return ocispec.Descriptor{}, fmt.Errorf("failed to open OCI layout tar %s: %w", imageTarPath, err)
 	}
 
-	// set up destination repository
-	dstRepoName := strings.Split(dstRepoAndRef, ":")[0]
-	dstRepo, err := remote.NewRepository(fmt.Sprintf("%s/%s", dstRegistry, dstRepoName))
+	dstRepo, err := newRepository(buildRepositoryReference(targetRegistry, repository), targetCredential)
 	if err != nil {
-		return fmt.Errorf("failed to create destination repository: %w", err)
-	}
-	dstCred := c.targetCredential
-	dstRepo.Client = &auth.Client{
-		Credential: func(ctx context.Context, hostport string) (auth.Credential, error) {
-			return auth.Credential{Username: dstCred.Username, Password: dstCred.Password}, nil
-		},
+		return ocispec.Descriptor{}, fmt.Errorf("failed to create target repository: %w", err)
 	}
 
-	// extract the reference (digest) for the source
-	srcReference := ""
-	if idx := strings.Index(srcRepoAndRef, "@"); idx != -1 {
-		srcReference = srcRepoAndRef[idx+1:]
+	desc, err := oras.Copy(ctx, sourceStore, buildTag, dstRepo, buildTag, oras.DefaultCopyOptions)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to copy OCI layout %s:%s to %s/%s:%s: %w",
+			imageTarPath, buildTag, NormalizeRegistryHost(targetRegistry), repository, buildTag, err)
 	}
 
-	// extract the tag for the destination
-	dstTag := ""
-	if idx := strings.Index(dstRepoAndRef, ":"); idx != -1 {
-		dstTag = dstRepoAndRef[idx+1:]
+	return desc, nil
+}
+
+func newRepository(reference string, credential Credential) (*remote.Repository, error) {
+	repository, err := remote.NewRepository(reference)
+	if err != nil {
+		return nil, err
 	}
 
-	if _, err := oras.Copy(ctx, srcRepo, srcReference, dstRepo, dstTag, oras.DefaultCopyOptions); err != nil {
-		return fmt.Errorf("failed to copy image: %w", err)
+	orasCred := auth.Credential{
+		Username:     credential.Username,
+		Password:     credential.Password,
+		RefreshToken: credential.RefreshToken,
 	}
 
-	return nil
+	repository.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      auth.NewCache(),
+		Credential: auth.StaticCredential(repository.Reference.Registry, orasCred),
+	}
+
+	return repository, nil
+}
+
+func buildRepositoryReference(registry, repository string) string {
+	return fmt.Sprintf("%s/%s", NormalizeRegistryHost(registry), strings.TrimPrefix(repository, "/"))
 }

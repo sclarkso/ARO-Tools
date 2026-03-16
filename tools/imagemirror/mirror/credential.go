@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -25,30 +26,40 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 )
 
-// Credential holds username/password for registry authentication.
+const (
+	acrDefaultUsername = "00000000-0000-0000-0000-000000000000"
+	aadTokenScope      = "https://management.azure.com/.default"
+
+	dockerHubRegistryHost = "docker.io"
+	dockerHubIndexHost    = "index.docker.io"
+	dockerHubRegistryV1   = "registry-1.docker.io"
+	dockerHubAPIV1Host    = "https://index.docker.io/v1/"
+)
+
+// Credential holds authentication details for registry access.
 type Credential struct {
-	Username string
-	Password string
+	Username     string
+	Password     string
+	RefreshToken string
 }
 
-// IsEmpty returns true if the credential has no username or password set.
+// IsEmpty returns true if the credential has no authentication data set.
 func (c Credential) IsEmpty() bool {
-	return c.Username == "" && c.Password == ""
+	return c.Username == "" && c.Password == "" && c.RefreshToken == ""
 }
 
 // IsCIRegistry checks if the source registry is a CI registry that requires
 // oc registry login. This is determined by the USE_OC_LOGIN_REGISTRIES env var,
 // which is set by the CI provisioning step.
 func IsCIRegistry(sourceRegistry string) bool {
-	ocLoginRegistries := os.Getenv("USE_OC_LOGIN_REGISTRIES")
-	if ocLoginRegistries == "" {
-		return false
-	}
-	for _, registry := range strings.Fields(ocLoginRegistries) {
-		if sourceRegistry == registry {
+	sourceHost := NormalizeRegistryHost(sourceRegistry)
+	for _, registry := range strings.Fields(os.Getenv("USE_OC_LOGIN_REGISTRIES")) {
+		if NormalizeRegistryHost(registry) == sourceHost {
 			return true
 		}
 	}
@@ -82,7 +93,7 @@ func GetOCRegistryCredential(ctx context.Context, registry string) (Credential, 
 		return Credential{}, fmt.Errorf("failed to read oc auth file: %w", err)
 	}
 
-	return extractCredentialFromDockerConfig(data, registry)
+	return credentialFromDockerConfig(data, registry)
 }
 
 // FetchPullSecretCredential fetches a Docker pull secret from Azure Key Vault
@@ -113,26 +124,43 @@ func FetchPullSecretCredential(ctx context.Context, azureCred azcore.TokenCreden
 		decoded = []byte(secretValue)
 	}
 
-	return extractCredentialFromDockerConfig(decoded, registry)
+	return credentialFromDockerConfig(decoded, registry)
 }
 
-// GetACRCredential gets a credential for an Azure Container Registry
-// using the az CLI to get an access token.
-func GetACRCredential(ctx context.Context, acrName string) (Credential, error) {
-	cmd := exec.CommandContext(ctx, "az", "acr", "login", "--name", acrName,
-		"--expose-token", "--output", "tsv", "--query", "accessToken")
-	output, err := cmd.Output()
+// ExchangeAADForACRToken exchanges an AAD access token for an ACR refresh token
+// using the Azure Container Registry SDK. This avoids shelling out to az CLI.
+func ExchangeAADForACRToken(ctx context.Context, azureCred azcore.TokenCredential, registryHost string) (Credential, error) {
+	token, err := azureCred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{aadTokenScope}})
 	if err != nil {
-		var stderr string
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr = string(exitErr.Stderr)
-		}
-		return Credential{}, fmt.Errorf("failed to get ACR access token for %s: %s: %w", acrName, stderr, err)
+		return Credential{}, fmt.Errorf("failed to acquire Azure AD token: %w", err)
+	}
+
+	client, err := azcontainerregistry.NewAuthenticationClient(
+		"https://"+NormalizeRegistryHost(registryHost), nil,
+	)
+	if err != nil {
+		return Credential{}, fmt.Errorf("failed to create ACR authentication client: %w", err)
+	}
+
+	response, err := client.ExchangeAADAccessTokenForACRRefreshToken(
+		ctx,
+		azcontainerregistry.PostContentSchemaGrantTypeAccessToken,
+		NormalizeRegistryHost(registryHost),
+		&azcontainerregistry.AuthenticationClientExchangeAADAccessTokenForACRRefreshTokenOptions{
+			AccessToken: &token.Token,
+		},
+	)
+	if err != nil {
+		return Credential{}, fmt.Errorf("failed to exchange AAD token for ACR refresh token: %w", err)
+	}
+
+	if response.RefreshToken == nil || *response.RefreshToken == "" {
+		return Credential{}, errors.New("ACR refresh token exchange returned an empty refresh token")
 	}
 
 	return Credential{
-		Username: "00000000-0000-0000-0000-000000000000",
-		Password: strings.TrimSpace(string(output)),
+		Username:     acrDefaultUsername,
+		RefreshToken: *response.RefreshToken,
 	}, nil
 }
 
@@ -152,55 +180,100 @@ func GetACRDomainSuffix(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-// extractCredentialFromDockerConfig parses Docker config JSON and extracts
+// credentialFromDockerConfig parses Docker config JSON and extracts
 // credentials for the given registry using exact host matching.
-func extractCredentialFromDockerConfig(data []byte, registry string) (Credential, error) {
-	var dockerConfig struct {
-		Auths map[string]struct {
-			Auth string `json:"auth"`
-		} `json:"auths"`
-	}
-	if err := json.Unmarshal(data, &dockerConfig); err != nil {
+// Returns an empty Credential (not an error) if no credentials are found.
+func credentialFromDockerConfig(data []byte, registry string) (Credential, error) {
+	var config dockerConfigFile
+	if err := json.Unmarshal(data, &config); err != nil {
 		return Credential{}, fmt.Errorf("failed to parse Docker config: %w", err)
 	}
 
-	for registryHost, regAuth := range dockerConfig.Auths {
-		if registryHostMatches(registry, registryHost) {
-			authDecoded, err := base64.StdEncoding.DecodeString(regAuth.Auth)
-			if err != nil {
-				return Credential{}, fmt.Errorf("failed to decode auth for %s: %w", registryHost, err)
-			}
-			parts := strings.SplitN(string(authDecoded), ":", 2)
-			if len(parts) != 2 {
-				return Credential{}, fmt.Errorf("invalid auth format for %s", registryHost)
-			}
-			return Credential{
-				Username: parts[0],
-				Password: parts[1],
-			}, nil
+	sourceHost := NormalizeRegistryHost(registry)
+	for registryKey, entry := range config.Auths {
+		if NormalizeRegistryHost(registryKey) != sourceHost {
+			continue
 		}
+
+		cred, err := entry.credential()
+		if err != nil {
+			return Credential{}, fmt.Errorf("failed to decode auth for %s: %w", registryKey, err)
+		}
+		return cred, nil
 	}
 
 	// no credentials found — return empty credential for anonymous access
 	return Credential{}, nil
 }
 
-// registryHostMatches compares a registry hostname against a Docker config key,
-// normalizing both to host[:port] for exact matching.
-func registryHostMatches(registry, configKey string) bool {
-	return normalizeRegistryHost(registry) == normalizeRegistryHost(configKey)
+// NormalizeRegistryHost extracts the host[:port] from a registry reference,
+// stripping any scheme or path components. Handles Docker Hub aliases.
+func NormalizeRegistryHost(input string) string {
+	host := strings.TrimSpace(input)
+	if host == "" {
+		return ""
+	}
+
+	if parsed, err := url.Parse(host); err == nil && parsed.Host != "" {
+		host = parsed.Host
+	}
+
+	host = strings.TrimPrefix(host, "//")
+	host = strings.TrimRight(host, "/")
+	if idx := strings.Index(host, "/"); idx != -1 {
+		host = host[:idx]
+	}
+	host = strings.ToLower(host)
+
+	// normalize Docker Hub aliases
+	switch host {
+	case dockerHubIndexHost, dockerHubRegistryV1:
+		return dockerHubRegistryHost
+	}
+	if strings.EqualFold(strings.TrimSpace(input), dockerHubAPIV1Host) {
+		return dockerHubRegistryHost
+	}
+
+	return host
 }
 
-// normalizeRegistryHost extracts the host[:port] from a registry reference,
-// stripping any scheme or path components.
-func normalizeRegistryHost(registry string) string {
-	if strings.Contains(registry, "://") {
-		if u, err := url.Parse(registry); err == nil {
-			return u.Host
+type dockerConfigFile struct {
+	Auths map[string]dockerAuthEntry `json:"auths"`
+}
+
+type dockerAuthEntry struct {
+	Auth          string `json:"auth,omitempty"`
+	Username      string `json:"username,omitempty"`
+	Password      string `json:"password,omitempty"`
+	IdentityToken string `json:"identitytoken,omitempty"`
+}
+
+func (e dockerAuthEntry) credential() (Credential, error) {
+	switch {
+	case strings.TrimSpace(e.IdentityToken) != "":
+		return Credential{
+			Username:     acrDefaultUsername,
+			RefreshToken: e.IdentityToken,
+		}, nil
+	case strings.TrimSpace(e.Username) != "" || strings.TrimSpace(e.Password) != "":
+		return Credential{
+			Username: e.Username,
+			Password: e.Password,
+		}, nil
+	case strings.TrimSpace(e.Auth) != "":
+		decoded, err := base64.StdEncoding.DecodeString(e.Auth)
+		if err != nil {
+			return Credential{}, fmt.Errorf("failed to base64-decode auth field: %w", err)
 		}
+		username, password, found := strings.Cut(string(decoded), ":")
+		if !found {
+			return Credential{}, errors.New("decoded auth field was missing username:password format")
+		}
+		return Credential{
+			Username: username,
+			Password: password,
+		}, nil
+	default:
+		return Credential{}, errors.New("registry auth entry did not contain credentials")
 	}
-	if idx := strings.Index(registry, "/"); idx != -1 {
-		registry = registry[:idx]
-	}
-	return registry
 }

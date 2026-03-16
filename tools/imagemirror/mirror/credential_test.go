@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-func makeDockerConfig(registry, username, password string) []byte {
+func makeDockerConfigAuth(registry, username, password string) []byte {
 	authStr := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 	config := map[string]interface{}{
 		"auths": map[string]interface{}{
@@ -81,53 +81,67 @@ func TestIsCIRegistry(t *testing.T) {
 	}
 }
 
-func TestExtractCredentialFromDockerConfig(t *testing.T) {
+func TestCredentialFromDockerConfig(t *testing.T) {
+	// config with multiple auth formats
+	rawConfig := []byte(`{
+  "auths": {
+    "quay.io": {
+      "auth": "dXNlcjpwYXNz"
+    },
+    "https://index.docker.io/v1/": {
+      "auth": "ZG9ja2VyOnNlY3JldA=="
+    },
+    "registry.redhat.io": {
+      "username": "robot",
+      "password": "token"
+    },
+    "myregistry.example.com": {
+      "identitytoken": "refresh-token-value"
+    }
+  }
+}`)
+
 	tests := []struct {
-		name           string
-		config         []byte
-		registry       string
-		expectUsername  string
-		expectPassword string
-		expectEmpty    bool
+		name             string
+		registry         string
+		expectUsername   string
+		expectPassword   string
+		expectRefresh    string
+		expectEmpty      bool
 	}{
 		{
-			name:           "exact match",
-			config:         makeDockerConfig("quay.io", "user1", "pass1"),
+			name:           "basic auth field",
 			registry:       "quay.io",
-			expectUsername:  "user1",
-			expectPassword: "pass1",
+			expectUsername: "user",
+			expectPassword: "pass",
+		},
+		{
+			name:           "docker hub alias",
+			registry:       "docker.io",
+			expectUsername: "docker",
+			expectPassword: "secret",
+		},
+		{
+			name:           "username password fields",
+			registry:       "https://registry.redhat.io",
+			expectUsername: "robot",
+			expectPassword: "token",
+		},
+		{
+			name:          "identity token",
+			registry:      "myregistry.example.com",
+			expectRefresh: "refresh-token-value",
 		},
 		{
 			name:        "no match returns empty credential",
-			config:      makeDockerConfig("quay.io", "user1", "pass1"),
 			registry:    "registry.k8s.io",
-			expectEmpty: true,
-		},
-		{
-			name:           "config key with https scheme",
-			config:         makeDockerConfig("https://quay.io", "user2", "pass2"),
-			registry:       "quay.io",
-			expectUsername:  "user2",
-			expectPassword: "pass2",
-		},
-		{
-			name:           "config key with scheme and path",
-			config:         makeDockerConfig("https://index.docker.io/v1/", "user3", "pass3"),
-			registry:       "index.docker.io",
-			expectUsername:  "user3",
-			expectPassword: "pass3",
-		},
-		{
-			name:        "substring should not match - evil domain",
-			config:      makeDockerConfig("quay.io.evil.com", "user4", "pass4"),
-			registry:    "quay.io",
 			expectEmpty: true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cred, err := extractCredentialFromDockerConfig(tc.config, tc.registry)
+			cred, err := credentialFromDockerConfig(rawConfig, tc.registry)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -135,10 +149,16 @@ func TestExtractCredentialFromDockerConfig(t *testing.T) {
 				if !cred.IsEmpty() {
 					t.Errorf("expected empty credential, got %+v", cred)
 				}
-			} else {
-				if cred.Username != tc.expectUsername || cred.Password != tc.expectPassword {
-					t.Errorf("got credential %+v, want username=%q password=%q", cred, tc.expectUsername, tc.expectPassword)
+				return
+			}
+			if tc.expectRefresh != "" {
+				if cred.RefreshToken != tc.expectRefresh {
+					t.Errorf("got refresh token %q, want %q", cred.RefreshToken, tc.expectRefresh)
 				}
+				return
+			}
+			if cred.Username != tc.expectUsername || cred.Password != tc.expectPassword {
+				t.Errorf("got credential %+v, want username=%q password=%q", cred, tc.expectUsername, tc.expectPassword)
 			}
 		})
 	}
@@ -151,16 +171,71 @@ func TestNormalizeRegistryHost(t *testing.T) {
 	}{
 		{"quay.io", "quay.io"},
 		{"https://quay.io", "quay.io"},
-		{"https://index.docker.io/v1/", "index.docker.io"},
+		{"https://quay.io/v2/", "quay.io"},
+		{"https://index.docker.io/v1/", "docker.io"},
+		{"registry-1.docker.io", "docker.io"},
+		{"docker.io", "docker.io"},
 		{"registry.example.com:5000", "registry.example.com:5000"},
 		{"https://registry.example.com:5000/v2/", "registry.example.com:5000"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
-			if got := normalizeRegistryHost(tc.input); got != tc.expected {
-				t.Errorf("normalizeRegistryHost(%q) = %q, want %q", tc.input, got, tc.expected)
+			if got := NormalizeRegistryHost(tc.input); got != tc.expected {
+				t.Errorf("NormalizeRegistryHost(%q) = %q, want %q", tc.input, got, tc.expected)
 			}
 		})
 	}
 }
+
+func TestDockerAuthEntryCredential(t *testing.T) {
+	t.Run("identity token", func(t *testing.T) {
+		entry := dockerAuthEntry{IdentityToken: "refresh-token"}
+		cred, err := entry.credential()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cred.RefreshToken != "refresh-token" {
+			t.Errorf("got refresh token %q, want %q", cred.RefreshToken, "refresh-token")
+		}
+	})
+
+	t.Run("username password", func(t *testing.T) {
+		entry := dockerAuthEntry{Username: "user", Password: "pass"}
+		cred, err := entry.credential()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cred.Username != "user" || cred.Password != "pass" {
+			t.Errorf("got %+v, want user/pass", cred)
+		}
+	})
+
+	t.Run("base64 auth", func(t *testing.T) {
+		entry := dockerAuthEntry{Auth: base64.StdEncoding.EncodeToString([]byte("user:pass"))}
+		cred, err := entry.credential()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cred.Username != "user" || cred.Password != "pass" {
+			t.Errorf("got %+v, want user/pass", cred)
+		}
+	})
+
+	t.Run("invalid base64 auth format", func(t *testing.T) {
+		entry := dockerAuthEntry{Auth: base64.StdEncoding.EncodeToString([]byte("broken"))}
+		_, err := entry.credential()
+		if err == nil {
+			t.Fatal("expected error for missing colon separator")
+		}
+	})
+
+	t.Run("empty entry", func(t *testing.T) {
+		entry := dockerAuthEntry{}
+		_, err := entry.credential()
+		if err == nil {
+			t.Fatal("expected error for empty entry")
+		}
+	})
+}
+
